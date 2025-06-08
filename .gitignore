@@ -1,5 +1,9 @@
 .nfs*
-
+crop_boxes/
+input/
+output/
+output/
+models/
 # compilation and distribution
 __pycache__
 _ext
