@@ -2,7 +2,7 @@
 crop_boxes/
 input/
 output/
-output/
+mask_analysis/
 models/
 # compilation and distribution
 __pycache__
