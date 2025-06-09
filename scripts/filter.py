@@ -14,6 +14,7 @@ from pathlib import Path
 import glob
 from typing import Tuple, Optional, Dict, Any
 from datetime import datetime
+import pandas as pd
 
 
 def find_largest_contour(mask: np.ndarray) -> Optional[np.ndarray]:
@@ -113,7 +114,56 @@ def apply_singularity_filter(mask: np.ndarray) -> Optional[np.ndarray]:
     return find_largest_contour(binary_mask)
 
 
-def process_mask(mask_path: str, circularity_threshold: float = 0.55) -> Tuple[Optional[np.ndarray], bool, bool, float, Dict[str, Any]]:
+def load_original_metadata(input_dir: Path) -> Optional[pd.DataFrame]:
+    """
+    Load original metadata.csv if it exists in the input directory.
+    
+    Args:
+        input_dir: Path to input directory
+        
+    Returns:
+        DataFrame with original metadata or None if not found
+    """
+    metadata_path = input_dir / "metadata.csv"
+    if metadata_path.exists():
+        try:
+            return pd.read_csv(metadata_path)
+        except Exception as e:
+            print(f"Warning: Could not read original metadata.csv: {e}")
+            return None
+    return None
+
+
+def get_mask_id_from_filename(filename: str) -> Optional[int]:
+    """
+    Extract mask ID from filename. Assumes format like 'mask_123.png' or '123.png'
+    
+    Args:
+        filename: Mask filename
+        
+    Returns:
+        Mask ID as integer or None if not found
+    """
+    # Remove extension
+    basename = Path(filename).stem
+    
+    # Try different patterns
+    patterns = [
+        basename,  # Just the number itself
+        basename.replace('mask_', ''),  # Remove 'mask_' prefix
+        basename.split('_')[-1],  # Last part after underscore
+    ]
+    
+    for pattern in patterns:
+        try:
+            return int(pattern)
+        except ValueError:
+            continue
+    
+    return None
+
+
+def process_mask(mask_path: str, circularity_threshold: float = 0.55, original_metadata: Optional[pd.DataFrame] = None, debug_mode: bool = False) -> Tuple[Optional[np.ndarray], bool, bool, float, Dict[str, Any]]:
     """
     Process a single mask through both filters.
     
@@ -124,38 +174,44 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.55) -> Tuple[O
     Returns:
         Tuple of (filtered_mask, passed_singularity, passed_circularity, circularity_score, metadata)
     """
+    filename = Path(mask_path).name
     metadata = {
-        'filename': Path(mask_path).name,
-        'original_path': mask_path,
-        'file_size_bytes': os.path.getsize(mask_path) if os.path.exists(mask_path) else 0,
-        'processing_timestamp': datetime.now().isoformat(),
-        'width': 0,
-        'height': 0,
-        'area_pixels': 0
+        'filename': filename
     }
+    
+    # Try to inherit original metadata if available
+    if original_metadata is not None:
+        mask_id = get_mask_id_from_filename(filename)
+        if mask_id is not None:
+            # Find matching row in original metadata
+            matching_rows = original_metadata[original_metadata['id'] == mask_id]
+            if not matching_rows.empty:
+                # Inherit all columns from original metadata
+                original_row = matching_rows.iloc[0].to_dict()
+                # Update metadata with original values, but keep our new processing-specific fields
+                for key, value in original_row.items():
+                    if key not in ['filename']:
+                        metadata[key] = value
     
     # Load mask
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
         print(f"Warning: Could not load mask {mask_path}")
-        metadata.update({
-            'status': 'FAILED_LOAD',
-            'error': 'Could not load image'
-        })
+        if debug_mode:
+            metadata.update({
+                'status': 'FAILED_LOAD',
+                'error': 'Could not load image'
+            })
         return None, False, False, 0.0, metadata
-    
-    metadata.update({
-        'width': mask.shape[1],
-        'height': mask.shape[0]
-    })
     
     # Apply singularity filter
     singular_mask = apply_singularity_filter(mask)
     if singular_mask is None:
-        metadata.update({
-            'status': 'FAILED_SINGULARITY',
-            'error': 'No valid contours found'
-        })
+        if debug_mode:
+            metadata.update({
+                'status': 'FAILED_SINGULARITY',
+                'error': 'No valid contours found'
+            })
         return None, False, False, 0.0, metadata
     
     passed_singularity = True
@@ -166,19 +222,23 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.55) -> Tuple[O
     if contours:
         largest_contour = max(contours, key=cv2.contourArea)
         circularity_score = calculate_circularity(largest_contour)
-        metadata['area_pixels'] = int(cv2.contourArea(largest_contour))
     
     # Apply circular filter
     passed_circularity = is_circular(singular_mask, circularity_threshold)
     
     if passed_circularity:
-        metadata['status'] = 'PASSED'
+        if debug_mode:
+            metadata.update({
+                'status': 'PASSED',
+                'error': 'none'
+            })
         return singular_mask, passed_singularity, passed_circularity, circularity_score, metadata
     else:
-        metadata.update({
-            'status': 'FAILED_CIRCULARITY',
-            'error': f'Circularity {circularity_score:.3f} below threshold {circularity_threshold}'
-        })
+        if debug_mode:
+            metadata.update({
+                'status': 'FAILED_CIRCULARITY',
+                'error': f'Circularity {circularity_score:.3f} below threshold {circularity_threshold}'
+            })
         return None, passed_singularity, passed_circularity, circularity_score, metadata
 
 
@@ -193,49 +253,57 @@ def write_metadata_csv(metadata_list: list, output_path: Path):
     if not metadata_list:
         return
     
-    fieldnames = [
+    # Dynamically determine all possible columns from all metadata entries
+    all_fieldnames = set()
+    for metadata in metadata_list:
+        all_fieldnames.update(metadata.keys())
+    
+    # Define preferred column order for common fields
+    preferred_order = [
         'filename',
-        'status',
-        'passed_singularity',
-        'passed_circularity', 
         'circularity_score',
-        'circularity_threshold',
-        'width',
-        'height',
-        'area_pixels',
-        'file_size_bytes',
-        'original_path',
-        'processing_timestamp',
-        'error'
+        'circularity_threshold'
     ]
+    
+    # Add debug-specific columns if any metadata contains them
+    if any('status' in metadata for metadata in metadata_list):
+        preferred_order.insert(1, 'status')
+    
+    # Create final fieldnames list: preferred order first, then any additional fields
+    fieldnames = []
+    for field in preferred_order:
+        if field in all_fieldnames:
+            fieldnames.append(field)
+            all_fieldnames.remove(field)
+    
+    # Add any remaining fields that weren't in the preferred order (except error)
+    remaining_fields = [field for field in sorted(all_fieldnames) if field != 'error']
+    fieldnames.extend(remaining_fields)
+    
+    # Add error column at the end for visibility
+    if 'error' in all_fieldnames:
+        fieldnames.append('error')
     
     with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         
         for metadata in metadata_list:
-            # Ensure all required fields are present
-            row = {}
-            for field in fieldnames:
-                if field in metadata:
-                    row[field] = metadata[field]
-                elif field == 'error':
-                    row[field] = metadata.get('error', '')
-                else:
-                    row[field] = ''
-            writer.writerow(row)
+            # Write all available metadata for this entry
+            writer.writerow(metadata)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Filter masks using singularity and circular filters")
+    parser = argparse.ArgumentParser(description="Filter masks using singularity and circular filters. If metadata.csv exists in input directory, all original columns will be inherited in the output metadata.")
     parser.add_argument("input_dir", help="Directory containing input masks")
     parser.add_argument("-o", "--output_dir", help="Output directory for filtered masks (default: creates filter_TIMESTAMP folder inside input_dir)")
     parser.add_argument("-c", "--circularity_threshold", type=float, default=0.55, 
-                       help="Minimum circularity score (0.0-1.0, default: 0.7)")
+                       help="Minimum circularity score (0.0-1.0, default: 0.55)")
     parser.add_argument("-e", "--extensions", nargs="+", default=["png", "jpg", "jpeg", "bmp", "tiff"],
                        help="Image file extensions to process")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite input directory instead of creating new folder")
     parser.add_argument("--dry_run", action="store_true", help="Show statistics without saving filtered masks")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode: show detailed logs and include all masks in metadata (passed and failed)")
     
     args = parser.parse_args()
     
@@ -272,6 +340,13 @@ def main():
     print(f"Found {len(mask_files)} mask files")
     print(f"Circularity threshold: {args.circularity_threshold}")
     
+    # Load original metadata if available
+    original_metadata = load_original_metadata(input_dir)
+    if original_metadata is not None:
+        print(f"Found original metadata.csv with {len(original_metadata)} entries")
+    else:
+        print("No original metadata.csv found - creating new metadata from scratch")
+    
     # Process masks
     stats = {
         'total': len(mask_files),
@@ -284,22 +359,25 @@ def main():
     metadata_list = []
     
     for i, mask_path in enumerate(mask_files):
-        print(f"Processing {i+1}/{len(mask_files)}: {Path(mask_path).name}", end=" ")
+        if args.debug:
+            print(f"Processing {i+1}/{len(mask_files)}: {Path(mask_path).name}", end=" ")
         
-        filtered_mask, passed_sing, passed_circ, circularity_score, metadata = process_mask(mask_path, args.circularity_threshold)
+        filtered_mask, passed_sing, passed_circ, circularity_score, metadata = process_mask(mask_path, args.circularity_threshold, original_metadata, args.debug)
         
         # Add additional metadata
         metadata.update({
-            'passed_singularity': passed_sing,
-            'passed_circularity': passed_circ,
             'circularity_score': round(circularity_score, 4),
             'circularity_threshold': args.circularity_threshold
         })
-        metadata_list.append(metadata)
+        
+        # In debug mode, include all masks; otherwise only include passed masks
+        if args.debug or (filtered_mask is not None and passed_circ):
+            metadata_list.append(metadata)
         
         if filtered_mask is None and not passed_sing:
             stats['failed_load'] += 1
-            print("- FAILED (could not load/process)")
+            if args.debug:
+                print("- FAILED (could not load/process)")
             continue
         
         if passed_sing:
@@ -315,12 +393,14 @@ def main():
                 # Save filtered mask
                 output_path = output_dir / Path(mask_path).name
                 cv2.imwrite(str(output_path), filtered_mask)
-            print("- PASSED")
+            if args.debug:
+                print("- PASSED")
         else:
-            if passed_sing and not passed_circ:
-                print("- FAILED (not circular enough)")
-            else:
-                print("- FAILED")
+            if args.debug:
+                if passed_sing and not passed_circ:
+                    print("- FAILED (not circular enough)")
+                else:
+                    print("- FAILED")
     
     # Write metadata CSV
     if not args.dry_run:
