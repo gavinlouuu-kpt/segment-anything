@@ -80,19 +80,23 @@ def is_contained_by(small_bbox: Tuple[int, int, int, int],
     return overlap_pct > overlap_threshold
 
 
-def categorize_bboxes(df: pd.DataFrame, overlap_threshold: float = 0.7) -> pd.DataFrame:
+def categorize_bboxes(df: pd.DataFrame, overlap_threshold: float = 0.7, include_reason: bool = False) -> pd.DataFrame:
     """
     Categorize bounding boxes as parent (0) or child (1) based on containment.
     
     Args:
         df: DataFrame with columns 'bbox_x0', 'bbox_y0', 'bbox_w', 'bbox_h'
         overlap_threshold: Minimum overlap percentage for containment (default 0.7)
+        include_reason: Whether to include categorization reason in metadata
         
     Returns:
-        DataFrame with added 'category' column (0=parent, 1=child)
+        DataFrame with added 'category' column (0=parent, 1=child) and optionally 'category_reason'
     """
     df = df.copy()
     df['category'] = 0  # Initialize all as parent (0)
+    
+    if include_reason:
+        df['category_reason'] = "Not contained by any other bbox"  # Default reason for parents
     
     n_bboxes = len(df)
     
@@ -100,23 +104,37 @@ def categorize_bboxes(df: pd.DataFrame, overlap_threshold: float = 0.7) -> pd.Da
     bboxes = [(row['bbox_x0'], row['bbox_y0'], row['bbox_w'], row['bbox_h']) 
               for _, row in df.iterrows()]
     
+    # Get bbox IDs (assuming 'id' column exists, otherwise use index)
+    if 'id' in df.columns:
+        bbox_ids = df['id'].tolist()
+    else:
+        bbox_ids = list(range(len(df)))
+    
     print(f"Processing {n_bboxes} bounding boxes...")
     
     # For each bbox, check if it's contained by any other bbox
     for i in range(n_bboxes):
         current_bbox = bboxes[i]
+        current_id = bbox_ids[i]
         
         for j in range(n_bboxes):
             if i == j:  # Skip self-comparison
                 continue
                 
             potential_parent = bboxes[j]
+            parent_id = bbox_ids[j]
             
             # Check if current bbox is contained by potential parent
             if is_contained_by(current_bbox, potential_parent, overlap_threshold):
                 df.iloc[i, df.columns.get_loc('category')] = 1  # Mark as child
-                print(f"  Bbox {i} (area={current_bbox[2]*current_bbox[3]}) is contained by "
-                      f"Bbox {j} (area={potential_parent[2]*potential_parent[3]})")
+                
+                if include_reason:
+                    overlap_pct = calculate_overlap_percentage(current_bbox, potential_parent)
+                    reason = f"Contained by bbox {parent_id} with {overlap_pct*100:.1f}% overlap"
+                    df.iloc[i, df.columns.get_loc('category_reason')] = reason
+                
+                print(f"  Bbox {current_id} (area={current_bbox[2]*current_bbox[3]}) is contained by "
+                      f"Bbox {parent_id} (area={potential_parent[2]*potential_parent[3]})")
                 break  # Once we find a parent, we can stop checking
     
     return df
@@ -136,13 +154,26 @@ def print_statistics(df: pd.DataFrame):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python categorise.py <metadata_csv_path> [output_csv_path]")
+        print("Usage: python categorise.py <metadata_csv_path> [output_csv_path] [overlap_threshold] [--debug]")
         print("Example: python categorise.py output/fluor_bead/metadata.csv output_categorized.csv 0.7")
+        print("Example with reason: python categorise.py output/fluor_bead/metadata.csv output_categorized.csv 0.7 --debug")
         sys.exit(1)
     
     input_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else None
-    overlap_threshold = float(sys.argv[3]) if len(sys.argv) > 3 else 0.7
+    output_path = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith('--') else None
+    
+    # Parse arguments for overlap threshold and include reason flag
+    overlap_threshold = 0.7
+    include_reason = False
+    
+    for arg in sys.argv[2:]:
+        if arg == '--debug':
+            include_reason = True
+        elif not arg.startswith('--') and arg != output_path:
+            try:
+                overlap_threshold = float(arg)
+            except ValueError:
+                pass
     
     # Validate input file
     if not os.path.exists(input_path):
@@ -151,6 +182,7 @@ def main():
     
     print(f"Loading metadata from: {input_path}")
     print(f"Overlap threshold: {overlap_threshold*100:.1f}%")
+    print(f"Include categorization reason: {include_reason}")
     
     try:
         # Load the metadata CSV
@@ -167,7 +199,7 @@ def main():
         print(f"Loaded {len(df)} bounding boxes from metadata file.")
         
         # Categorize the bounding boxes
-        df_categorized = categorize_bboxes(df, overlap_threshold)
+        df_categorized = categorize_bboxes(df, overlap_threshold, include_reason)
         
         # Print statistics
         print_statistics(df_categorized)
