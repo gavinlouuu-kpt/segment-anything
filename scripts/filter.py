@@ -123,7 +123,7 @@ def calculate_bbox_iou(bbox1: Tuple[int, int, int, int], bbox2: Tuple[int, int, 
     return intersection_area / union_area
 
 
-def apply_overlap_filter(mask_data_list: List[Dict[str, Any]], overlap_threshold: float = 0.9) -> List[Dict[str, Any]]:
+def apply_overlap_filter(mask_data_list: List[Dict[str, Any]], overlap_threshold: float = 0.8) -> List[Dict[str, Any]]:
     """
     Apply overlap filter to remove masks with high bounding box overlap.
     
@@ -163,22 +163,24 @@ def apply_overlap_filter(mask_data_list: List[Dict[str, Any]], overlap_threshold
             iou = calculate_bbox_iou(mask_data_list[i]['bbox'], mask_data_list[j]['bbox'])
             
             if iou >= overlap_threshold:
-                # Keep the mask with higher circularity score
-                circ_i = mask_data_list[i]['metadata'].get('circularity_score', 0.0)
-                circ_j = mask_data_list[j]['metadata'].get('circularity_score', 0.0)
+                # Remove the larger mask (keep the smaller one)
+                area_i = mask_data_list[i]['metadata'].get('area', 0.0)
+                area_j = mask_data_list[j]['metadata'].get('area', 0.0)
                 
                 filename_i = Path(mask_data_list[i]['path']).name
                 filename_j = Path(mask_data_list[j]['path']).name
                 
-                if circ_i >= circ_j:
-                    to_remove.add(j)
-                    mask_data_list[j]['metadata']['overlap_iou'] = round(iou, 4)
-                    mask_data_list[j]['metadata']['overlap_with'] = filename_i
-                else:
+                if area_i >= area_j:
+                    # Remove the larger mask (i)
                     to_remove.add(i)
                     mask_data_list[i]['metadata']['overlap_iou'] = round(iou, 4)
                     mask_data_list[i]['metadata']['overlap_with'] = filename_j
                     break  # Move to next i since this one is being removed
+                else:
+                    # Remove the larger mask (j)
+                    to_remove.add(j)
+                    mask_data_list[j]['metadata']['overlap_iou'] = round(iou, 4)
+                    mask_data_list[j]['metadata']['overlap_with'] = filename_i
     
     # Return filtered list
     filtered_list = []
@@ -458,8 +460,8 @@ def main():
     parser.add_argument("-o", "--output_dir", help="Output directory for filtered masks (default: creates filter_TIMESTAMP folder inside input_dir)")
     parser.add_argument("-c", "--circularity_threshold", type=float, default=0.6, 
                        help="Minimum circularity score (0.0-1.0, default: 0.6)")
-    parser.add_argument("--overlap_threshold", type=float, default=0.9,
-                       help="IoU threshold for overlap filter (0.0-1.0, default: 0.9)")
+    parser.add_argument("--overlap_threshold", type=float, default=0.8,
+                       help="IoU threshold for overlap filter (0.0-1.0, default: 0.8)")
     parser.add_argument("-e", "--extensions", nargs="+", default=["png", "jpg", "jpeg", "bmp", "tiff"],
                        help="Image file extensions to process")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite input directory instead of creating new folder")
