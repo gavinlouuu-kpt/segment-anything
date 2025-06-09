@@ -12,7 +12,7 @@ import argparse
 import csv
 from pathlib import Path
 import glob
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 from datetime import datetime
 import pandas as pd
 
@@ -65,7 +65,131 @@ def calculate_circularity(contour: np.ndarray) -> float:
     return min(circularity, 1.0)  # Cap at 1.0 for numerical stability
 
 
-def is_circular(mask: np.ndarray, circularity_threshold: float = 0.7) -> bool:
+def get_bounding_box(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    """
+    Get bounding box coordinates from a binary mask.
+    
+    Args:
+        mask: Binary mask as numpy array
+        
+    Returns:
+        Tuple of (x, y, width, height) of bounding box
+    """
+    # Find contours
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return (0, 0, 0, 0)
+    
+    # Get bounding box of the largest contour
+    largest_contour = max(contours, key=cv2.contourArea)
+    return cv2.boundingRect(largest_contour)
+
+
+def calculate_bbox_iou(bbox1: Tuple[int, int, int, int], bbox2: Tuple[int, int, int, int]) -> float:
+    """
+    Calculate Intersection over Union (IoU) of two bounding boxes.
+    
+    Args:
+        bbox1: First bounding box as (x, y, width, height)
+        bbox2: Second bounding box as (x, y, width, height)
+        
+    Returns:
+        IoU score (0.0 to 1.0)
+    """
+    x1, y1, w1, h1 = bbox1
+    x2, y2, w2, h2 = bbox2
+    
+    # Calculate intersection rectangle
+    x_left = max(x1, x2)
+    y_top = max(y1, y2)
+    x_right = min(x1 + w1, x2 + w2)
+    y_bottom = min(y1 + h1, y2 + h2)
+    
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+    
+    # Calculate intersection area
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    
+    # Calculate union area
+    bbox1_area = w1 * h1
+    bbox2_area = w2 * h2
+    union_area = bbox1_area + bbox2_area - intersection_area
+    
+    if union_area == 0:
+        return 0.0
+    
+    return intersection_area / union_area
+
+
+def apply_overlap_filter(mask_data_list: List[Dict[str, Any]], overlap_threshold: float = 0.9) -> List[Dict[str, Any]]:
+    """
+    Apply overlap filter to remove masks with high bounding box overlap.
+    
+    Args:
+        mask_data_list: List of dictionaries containing mask data and metadata
+        overlap_threshold: IoU threshold above which masks are considered overlapping
+        
+    Returns:
+        Filtered list with overlapping masks removed (keeps the one with highest circularity)
+    """
+    if len(mask_data_list) <= 1:
+        return mask_data_list
+    
+    # Calculate bounding boxes for all masks
+    for mask_data in mask_data_list:
+        if mask_data['mask'] is not None:
+            mask_data['bbox'] = get_bounding_box(mask_data['mask'])
+        else:
+            mask_data['bbox'] = (0, 0, 0, 0)
+    
+    # Find groups of overlapping masks
+    to_remove = set()
+    
+    for i in range(len(mask_data_list)):
+        if i in to_remove:
+            continue
+            
+        for j in range(i + 1, len(mask_data_list)):
+            if j in to_remove:
+                continue
+            
+            # Skip if either mask is None
+            if mask_data_list[i]['mask'] is None or mask_data_list[j]['mask'] is None:
+                continue
+            
+            # Calculate IoU
+            iou = calculate_bbox_iou(mask_data_list[i]['bbox'], mask_data_list[j]['bbox'])
+            
+            if iou >= overlap_threshold:
+                # Keep the mask with higher circularity score
+                circ_i = mask_data_list[i]['metadata'].get('circularity_score', 0.0)
+                circ_j = mask_data_list[j]['metadata'].get('circularity_score', 0.0)
+                
+                filename_i = Path(mask_data_list[i]['path']).name
+                filename_j = Path(mask_data_list[j]['path']).name
+                
+                if circ_i >= circ_j:
+                    to_remove.add(j)
+                    mask_data_list[j]['metadata']['overlap_iou'] = round(iou, 4)
+                    mask_data_list[j]['metadata']['overlap_with'] = filename_i
+                else:
+                    to_remove.add(i)
+                    mask_data_list[i]['metadata']['overlap_iou'] = round(iou, 4)
+                    mask_data_list[i]['metadata']['overlap_with'] = filename_j
+                    break  # Move to next i since this one is being removed
+    
+    # Return filtered list
+    filtered_list = []
+    for i, mask_data in enumerate(mask_data_list):
+        if i not in to_remove:
+            filtered_list.append(mask_data)
+    
+    return filtered_list
+
+
+def is_circular(mask: np.ndarray, circularity_threshold: float = 0.6) -> bool:
     """
     Check if a mask represents a circular shape.
     
@@ -163,7 +287,7 @@ def get_mask_id_from_filename(filename: str) -> Optional[int]:
     return None
 
 
-def process_mask(mask_path: str, circularity_threshold: float = 0.55, original_metadata: Optional[pd.DataFrame] = None, debug_mode: bool = False) -> Tuple[Optional[np.ndarray], bool, bool, float, Dict[str, Any]]:
+def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_metadata: Optional[pd.DataFrame] = None, debug_mode: bool = False) -> Tuple[Optional[np.ndarray], bool, bool, float, Dict[str, Any]]:
     """
     Process a single mask through both filters.
     
@@ -223,6 +347,38 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.55, original_m
         largest_contour = max(contours, key=cv2.contourArea)
         circularity_score = calculate_circularity(largest_contour)
     
+    # Update bounding box coordinates based on the filtered mask
+    bbox_x, bbox_y, bbox_w, bbox_h = get_bounding_box(singular_mask)
+    
+    # Calculate centroid from the filtered mask
+    contours, _ = cv2.findContours(singular_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest_contour)
+        if M["m00"] != 0:
+            centroid_x = M["m10"] / M["m00"]
+            centroid_y = M["m01"] / M["m00"]
+        else:
+            centroid_x = bbox_x + bbox_w / 2
+            centroid_y = bbox_y + bbox_h / 2
+    else:
+        centroid_x = bbox_x + bbox_w / 2
+        centroid_y = bbox_y + bbox_h / 2
+    
+    # Calculate actual area from the filtered mask
+    actual_area = cv2.countNonZero(singular_mask)
+    
+    # Update metadata with corrected geometric properties
+    metadata.update({
+        'area': float(actual_area),
+        'bbox_w': float(bbox_w),
+        'bbox_h': float(bbox_h), 
+        'bbox_x0': float(bbox_x),
+        'bbox_y0': float(bbox_y),
+        'centroid_x': centroid_x,
+        'centroid_y': centroid_y
+    })
+    
     # Apply circular filter
     passed_circularity = is_circular(singular_mask, circularity_threshold)
     
@@ -262,7 +418,10 @@ def write_metadata_csv(metadata_list: list, output_path: Path):
     preferred_order = [
         'filename',
         'circularity_score',
-        'circularity_threshold'
+        'circularity_threshold',
+        'overlap_threshold',
+        'overlap_iou',
+        'overlap_with'
     ]
     
     # Add debug-specific columns if any metadata contains them
@@ -294,11 +453,13 @@ def write_metadata_csv(metadata_list: list, output_path: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Filter masks using singularity and circular filters. If metadata.csv exists in input directory, all original columns will be inherited in the output metadata.")
+    parser = argparse.ArgumentParser(description="Filter masks using singularity, circular, and overlap filters. If metadata.csv exists in input directory, all original columns will be inherited in the output metadata.")
     parser.add_argument("input_dir", help="Directory containing input masks")
     parser.add_argument("-o", "--output_dir", help="Output directory for filtered masks (default: creates filter_TIMESTAMP folder inside input_dir)")
-    parser.add_argument("-c", "--circularity_threshold", type=float, default=0.55, 
-                       help="Minimum circularity score (0.0-1.0, default: 0.55)")
+    parser.add_argument("-c", "--circularity_threshold", type=float, default=0.6, 
+                       help="Minimum circularity score (0.0-1.0, default: 0.6)")
+    parser.add_argument("--overlap_threshold", type=float, default=0.9,
+                       help="IoU threshold for overlap filter (0.0-1.0, default: 0.9)")
     parser.add_argument("-e", "--extensions", nargs="+", default=["png", "jpg", "jpeg", "bmp", "tiff"],
                        help="Image file extensions to process")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite input directory instead of creating new folder")
@@ -339,6 +500,7 @@ def main():
     
     print(f"Found {len(mask_files)} mask files")
     print(f"Circularity threshold: {args.circularity_threshold}")
+    print(f"Overlap threshold: {args.overlap_threshold}")
     
     # Load original metadata if available
     original_metadata = load_original_metadata(input_dir)
@@ -347,16 +509,18 @@ def main():
     else:
         print("No original metadata.csv found - creating new metadata from scratch")
     
-    # Process masks
+    # Process masks (singularity + circularity filters)
     stats = {
         'total': len(mask_files),
         'passed_singularity': 0,
         'passed_circularity': 0,
         'passed_both': 0,
+        'passed_overlap': 0,
         'failed_load': 0
     }
     
-    metadata_list = []
+    all_metadata_list = []  # For debug mode - includes all masks
+    passed_mask_data_list = []  # For overlap filtering - only passed masks
     
     for i, mask_path in enumerate(mask_files):
         if args.debug:
@@ -367,12 +531,13 @@ def main():
         # Add additional metadata
         metadata.update({
             'circularity_score': round(circularity_score, 4),
-            'circularity_threshold': args.circularity_threshold
+            'circularity_threshold': args.circularity_threshold,
+            'overlap_threshold': args.overlap_threshold
         })
         
-        # In debug mode, include all masks; otherwise only include passed masks
-        if args.debug or (filtered_mask is not None and passed_circ):
-            metadata_list.append(metadata)
+        # Always add to all_metadata_list for debug mode
+        if args.debug:
+            all_metadata_list.append(metadata)
         
         if filtered_mask is None and not passed_sing:
             stats['failed_load'] += 1
@@ -389,12 +554,15 @@ def main():
         if filtered_mask is not None and passed_circ:
             stats['passed_both'] += 1
             
-            if not args.dry_run:
-                # Save filtered mask
-                output_path = output_dir / Path(mask_path).name
-                cv2.imwrite(str(output_path), filtered_mask)
+            # Store mask data for overlap filtering
+            passed_mask_data_list.append({
+                'mask': filtered_mask,
+                'metadata': metadata,
+                'path': mask_path
+            })
+            
             if args.debug:
-                print("- PASSED")
+                print("- PASSED (before overlap filter)")
         else:
             if args.debug:
                 if passed_sing and not passed_circ:
@@ -402,11 +570,60 @@ def main():
                 else:
                     print("- FAILED")
     
+    # Apply overlap filter to passed masks
+    print(f"\nApplying overlap filter to {len(passed_mask_data_list)} masks...")
+    filtered_mask_data_list = apply_overlap_filter(passed_mask_data_list, args.overlap_threshold)
+    stats['passed_overlap'] = len(filtered_mask_data_list)
+    
+    # Create final metadata list
+    if args.debug:
+        # In debug mode, use all_metadata_list but update overlap info for removed masks
+        final_metadata_list = all_metadata_list
+        
+        # Create mapping from filename to updated metadata from overlap filter
+        overlap_metadata_map = {}
+        for data in passed_mask_data_list:
+            filename = Path(data['path']).name
+            overlap_metadata_map[filename] = data['metadata']
+        
+        # Add overlap info to passed masks
+        kept_filenames = {Path(data['path']).name for data in filtered_mask_data_list}
+        for metadata in final_metadata_list:
+            filename = metadata['filename']
+            
+            if filename in kept_filenames:
+                # This mask was kept after overlap filter - no changes needed
+                pass
+            elif metadata.get('status') == 'PASSED':
+                # This mask passed initial filters but was removed by overlap filter
+                metadata['status'] = 'FAILED_OVERLAP'
+                if filename in overlap_metadata_map:
+                    overlap_meta = overlap_metadata_map[filename]
+                    if 'overlap_iou' in overlap_meta:
+                        metadata['overlap_iou'] = overlap_meta['overlap_iou']
+                    if 'overlap_with' in overlap_meta:
+                        overlap_with = overlap_meta['overlap_with']
+                        iou_value = overlap_meta.get('overlap_iou', 'unknown')
+                        metadata['error'] = f'Overlaps with {overlap_with} (IoU: {iou_value})'
+                    else:
+                        metadata['error'] = 'Removed due to overlap with another mask'
+                else:
+                    metadata['error'] = 'Removed due to overlap with another mask'
+    else:
+        # In normal mode, only include masks that passed all filters
+        final_metadata_list = [data['metadata'] for data in filtered_mask_data_list]
+    
+    # Save filtered masks
+    if not args.dry_run:
+        for mask_data in filtered_mask_data_list:
+            output_path = output_dir / Path(mask_data['path']).name
+            cv2.imwrite(str(output_path), mask_data['mask'])
+    
     # Write metadata CSV
     if not args.dry_run:
         metadata_csv_path = output_dir / "metadata.csv"
-        write_metadata_csv(metadata_list, metadata_csv_path)
-        print(f"\nMetadata saved to: {metadata_csv_path}")
+        write_metadata_csv(final_metadata_list, metadata_csv_path)
+        print(f"Metadata saved to: {metadata_csv_path}")
     
     # Print statistics
     print("\n" + "="*50)
@@ -416,8 +633,10 @@ def main():
     print(f"Failed to load/process: {stats['failed_load']}")
     print(f"Passed singularity filter: {stats['passed_singularity']}")
     print(f"Passed circularity filter: {stats['passed_circularity']}")
-    print(f"Passed both filters: {stats['passed_both']}")
-    print(f"Success rate: {stats['passed_both']/stats['total']*100:.1f}%")
+    print(f"Passed both initial filters: {stats['passed_both']}")
+    print(f"Passed all filters (including overlap): {stats['passed_overlap']}")
+    print(f"Removed by overlap filter: {stats['passed_both'] - stats['passed_overlap']}")
+    print(f"Final success rate: {stats['passed_overlap']/stats['total']*100:.1f}%")
     
     if not args.dry_run:
         print(f"\nFiltered masks saved to: {output_dir}")

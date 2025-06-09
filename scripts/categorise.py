@@ -8,7 +8,7 @@ and categorizes each bbox as:
 - Child (1): Contained by another bbox with >70% overlap
 
 Usage:
-    python categorise.py <metadata_csv_path> [output_csv_path]
+    python categorise.py <metadata_csv_path> [output_csv_path] [overlap_threshold] [--debug]
 """
 
 import pandas as pd
@@ -83,6 +83,7 @@ def is_contained_by(small_bbox: Tuple[int, int, int, int],
 def categorize_bboxes(df: pd.DataFrame, overlap_threshold: float = 0.7, include_reason: bool = False) -> pd.DataFrame:
     """
     Categorize bounding boxes as parent (0) or child (1) based on containment.
+    Only considers masks with PASSED status for categorization logic.
     
     Args:
         df: DataFrame with columns 'bbox_x0', 'bbox_y0', 'bbox_w', 'bbox_h'
@@ -98,24 +99,47 @@ def categorize_bboxes(df: pd.DataFrame, overlap_threshold: float = 0.7, include_
     if include_reason:
         df['category_reason'] = "Not contained by any other bbox"  # Default reason for parents
     
-    n_bboxes = len(df)
+    # Filter to only PASSED masks for categorization logic
+    if 'status' in df.columns:
+        passed_mask = df['status'] == 'PASSED'
+        passed_df = df[passed_mask].copy()
+        print(f"Filtering to {len(passed_df)} PASSED masks out of {len(df)} total masks for categorization")
+        
+        # Set FAILED masks to have a specific reason if include_reason is True
+        if include_reason:
+            failed_mask = df['status'] != 'PASSED'
+            df.loc[failed_mask, 'category_reason'] = "Excluded from categorization (FAILED status)"
+    else:
+        # If no status column, assume all are passed
+        passed_df = df.copy()
+        print(f"No status column found, assuming all {len(df)} masks are passed")
     
-    # Extract bbox coordinates as tuples for faster processing
+    n_bboxes = len(passed_df)
+    
+    if n_bboxes == 0:
+        print("No PASSED masks found for categorization")
+        return df
+    
+    # Extract bbox coordinates as tuples for faster processing (only from PASSED masks)
     bboxes = [(row['bbox_x0'], row['bbox_y0'], row['bbox_w'], row['bbox_h']) 
-              for _, row in df.iterrows()]
+              for _, row in passed_df.iterrows()]
     
     # Get bbox IDs (assuming 'id' column exists, otherwise use index)
-    if 'id' in df.columns:
-        bbox_ids = df['id'].tolist()
+    if 'id' in passed_df.columns:
+        bbox_ids = passed_df['id'].tolist()
     else:
-        bbox_ids = list(range(len(df)))
+        bbox_ids = list(range(len(passed_df)))
     
-    print(f"Processing {n_bboxes} bounding boxes...")
+    # Get the original indices in the full dataframe
+    passed_indices = passed_df.index.tolist()
     
-    # For each bbox, check if it's contained by any other bbox
+    print(f"Processing {n_bboxes} PASSED bounding boxes...")
+    
+    # For each PASSED bbox, check if it's contained by any other PASSED bbox
     for i in range(n_bboxes):
         current_bbox = bboxes[i]
         current_id = bbox_ids[i]
+        current_df_idx = passed_indices[i]
         
         for j in range(n_bboxes):
             if i == j:  # Skip self-comparison
@@ -123,15 +147,16 @@ def categorize_bboxes(df: pd.DataFrame, overlap_threshold: float = 0.7, include_
                 
             potential_parent = bboxes[j]
             parent_id = bbox_ids[j]
+            parent_df_idx = passed_indices[j]
             
             # Check if current bbox is contained by potential parent
             if is_contained_by(current_bbox, potential_parent, overlap_threshold):
-                df.iloc[i, df.columns.get_loc('category')] = 1  # Mark as child
+                df.iloc[df.index.get_loc(current_df_idx), df.columns.get_loc('category')] = 1  # Mark as child
                 
                 if include_reason:
                     overlap_pct = calculate_overlap_percentage(current_bbox, potential_parent)
                     reason = f"Contained by bbox {parent_id} with {overlap_pct*100:.1f}% overlap"
-                    df.iloc[i, df.columns.get_loc('category_reason')] = reason
+                    df.iloc[df.index.get_loc(current_df_idx), df.columns.get_loc('category_reason')] = reason
                 
                 print(f"  Bbox {current_id} (area={current_bbox[2]*current_bbox[3]}) is contained by "
                       f"Bbox {parent_id} (area={potential_parent[2]*potential_parent[3]})")
@@ -157,6 +182,7 @@ def main():
         print("Usage: python categorise.py <metadata_csv_path> [output_csv_path] [overlap_threshold] [--debug]")
         print("Example: python categorise.py output/fluor_bead/metadata.csv output_categorized.csv 0.7")
         print("Example with reason: python categorise.py output/fluor_bead/metadata.csv output_categorized.csv 0.7 --debug")
+        print("Note: Only PASSED masks are considered for categorization. FAILED masks are excluded.")
         sys.exit(1)
     
     input_path = sys.argv[1]
@@ -209,11 +235,9 @@ def main():
             df_categorized.to_csv(output_path, index=False)
             print(f"\nCategorized metadata saved to: {output_path}")
         else:
-            # Generate default output filename
-            base_name = os.path.splitext(input_path)[0]
-            output_path = f"{base_name}_categorized.csv"
-            df_categorized.to_csv(output_path, index=False)
-            print(f"\nCategorized metadata saved to: {output_path}")
+            # Overwrite the original file
+            df_categorized.to_csv(input_path, index=False)
+            print(f"\nCategorized metadata saved to: {input_path} (original file overwritten)")
             
     except Exception as e:
         print(f"Error processing file: {e}")
