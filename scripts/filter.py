@@ -9,9 +9,11 @@ import os
 import cv2
 import numpy as np
 import argparse
+import csv
 from pathlib import Path
 import glob
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Any
+from datetime import datetime
 
 
 def find_largest_contour(mask: np.ndarray) -> Optional[np.ndarray]:
@@ -111,7 +113,7 @@ def apply_singularity_filter(mask: np.ndarray) -> Optional[np.ndarray]:
     return find_largest_contour(binary_mask)
 
 
-def process_mask(mask_path: str, circularity_threshold: float = 0.7) -> Tuple[Optional[np.ndarray], bool, bool]:
+def process_mask(mask_path: str, circularity_threshold: float = 0.55) -> Tuple[Optional[np.ndarray], bool, bool, float, Dict[str, Any]]:
     """
     Process a single mask through both filters.
     
@@ -120,35 +122,115 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.7) -> Tuple[Op
         circularity_threshold: Minimum circularity score
         
     Returns:
-        Tuple of (filtered_mask, passed_singularity, passed_circularity)
+        Tuple of (filtered_mask, passed_singularity, passed_circularity, circularity_score, metadata)
     """
+    metadata = {
+        'filename': Path(mask_path).name,
+        'original_path': mask_path,
+        'file_size_bytes': os.path.getsize(mask_path) if os.path.exists(mask_path) else 0,
+        'processing_timestamp': datetime.now().isoformat(),
+        'width': 0,
+        'height': 0,
+        'area_pixels': 0
+    }
+    
     # Load mask
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
         print(f"Warning: Could not load mask {mask_path}")
-        return None, False, False
+        metadata.update({
+            'status': 'FAILED_LOAD',
+            'error': 'Could not load image'
+        })
+        return None, False, False, 0.0, metadata
+    
+    metadata.update({
+        'width': mask.shape[1],
+        'height': mask.shape[0]
+    })
     
     # Apply singularity filter
     singular_mask = apply_singularity_filter(mask)
     if singular_mask is None:
-        return None, False, False
+        metadata.update({
+            'status': 'FAILED_SINGULARITY',
+            'error': 'No valid contours found'
+        })
+        return None, False, False, 0.0, metadata
     
     passed_singularity = True
+    
+    # Calculate circularity score
+    contours, _ = cv2.findContours(singular_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    circularity_score = 0.0
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        circularity_score = calculate_circularity(largest_contour)
+        metadata['area_pixels'] = int(cv2.contourArea(largest_contour))
     
     # Apply circular filter
     passed_circularity = is_circular(singular_mask, circularity_threshold)
     
     if passed_circularity:
-        return singular_mask, passed_singularity, passed_circularity
+        metadata['status'] = 'PASSED'
+        return singular_mask, passed_singularity, passed_circularity, circularity_score, metadata
     else:
-        return None, passed_singularity, passed_circularity
+        metadata.update({
+            'status': 'FAILED_CIRCULARITY',
+            'error': f'Circularity {circularity_score:.3f} below threshold {circularity_threshold}'
+        })
+        return None, passed_singularity, passed_circularity, circularity_score, metadata
+
+
+def write_metadata_csv(metadata_list: list, output_path: Path):
+    """
+    Write metadata to CSV file.
+    
+    Args:
+        metadata_list: List of metadata dictionaries
+        output_path: Path where to save the CSV file
+    """
+    if not metadata_list:
+        return
+    
+    fieldnames = [
+        'filename',
+        'status',
+        'passed_singularity',
+        'passed_circularity', 
+        'circularity_score',
+        'circularity_threshold',
+        'width',
+        'height',
+        'area_pixels',
+        'file_size_bytes',
+        'original_path',
+        'processing_timestamp',
+        'error'
+    ]
+    
+    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for metadata in metadata_list:
+            # Ensure all required fields are present
+            row = {}
+            for field in fieldnames:
+                if field in metadata:
+                    row[field] = metadata[field]
+                elif field == 'error':
+                    row[field] = metadata.get('error', '')
+                else:
+                    row[field] = ''
+            writer.writerow(row)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Filter masks using singularity and circular filters")
     parser.add_argument("input_dir", help="Directory containing input masks")
     parser.add_argument("-o", "--output_dir", help="Output directory for filtered masks (default: creates filter_TIMESTAMP folder inside input_dir)")
-    parser.add_argument("-c", "--circularity_threshold", type=float, default=0.7, 
+    parser.add_argument("-c", "--circularity_threshold", type=float, default=0.55, 
                        help="Minimum circularity score (0.0-1.0, default: 0.7)")
     parser.add_argument("-e", "--extensions", nargs="+", default=["png", "jpg", "jpeg", "bmp", "tiff"],
                        help="Image file extensions to process")
@@ -170,7 +252,6 @@ def main():
         output_dir = Path(args.output_dir)
     else:
         # Create filter_TIMESTAMP folder inside input directory
-        from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = input_dir / f"filter_{timestamp}"
     
@@ -200,10 +281,21 @@ def main():
         'failed_load': 0
     }
     
+    metadata_list = []
+    
     for i, mask_path in enumerate(mask_files):
         print(f"Processing {i+1}/{len(mask_files)}: {Path(mask_path).name}", end=" ")
         
-        filtered_mask, passed_sing, passed_circ = process_mask(mask_path, args.circularity_threshold)
+        filtered_mask, passed_sing, passed_circ, circularity_score, metadata = process_mask(mask_path, args.circularity_threshold)
+        
+        # Add additional metadata
+        metadata.update({
+            'passed_singularity': passed_sing,
+            'passed_circularity': passed_circ,
+            'circularity_score': round(circularity_score, 4),
+            'circularity_threshold': args.circularity_threshold
+        })
+        metadata_list.append(metadata)
         
         if filtered_mask is None and not passed_sing:
             stats['failed_load'] += 1
@@ -229,6 +321,12 @@ def main():
                 print("- FAILED (not circular enough)")
             else:
                 print("- FAILED")
+    
+    # Write metadata CSV
+    if not args.dry_run:
+        metadata_csv_path = output_dir / "metadata.csv"
+        write_metadata_csv(metadata_list, metadata_csv_path)
+        print(f"\nMetadata saved to: {metadata_csv_path}")
     
     # Print statistics
     print("\n" + "="*50)
