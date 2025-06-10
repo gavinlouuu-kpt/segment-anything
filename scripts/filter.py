@@ -217,6 +217,30 @@ def is_circular(mask: np.ndarray, circularity_threshold: float = 0.6) -> bool:
     return circularity >= circularity_threshold
 
 
+def touches_edge(bbox: Tuple[int, int, int, int], image_shape: Tuple[int, int], edge_margin: int = 0) -> bool:
+    """
+    Check if a bounding box touches the edge of an image.
+    
+    Args:
+        bbox: Bounding box as (x, y, width, height)
+        image_shape: Image shape as (height, width)
+        edge_margin: Minimum distance from edge (default: 0 means touching edge fails)
+        
+    Returns:
+        True if bounding box touches edge (within margin), False otherwise
+    """
+    x, y, w, h = bbox
+    img_height, img_width = image_shape
+    
+    # Check if any edge of the bounding box is too close to image edge
+    left_edge = x <= edge_margin
+    top_edge = y <= edge_margin
+    right_edge = (x + w) >= (img_width - edge_margin)
+    bottom_edge = (y + h) >= (img_height - edge_margin)
+    
+    return left_edge or top_edge or right_edge or bottom_edge
+
+
 def apply_singularity_filter(mask: np.ndarray) -> Optional[np.ndarray]:
     """
     Apply singularity filter: keep only the largest blob.
@@ -289,18 +313,20 @@ def get_mask_id_from_filename(filename: str) -> Optional[int]:
     return None
 
 
-def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_metadata: Optional[pd.DataFrame] = None, debug_mode: bool = False) -> Tuple[Optional[np.ndarray], bool, bool, float, Dict[str, Any], Dict[str, Any]]:
+def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_metadata: Optional[pd.DataFrame] = None, debug_mode: bool = False, enable_edge_filter: bool = True, edge_margin: int = 0) -> Tuple[Optional[np.ndarray], bool, bool, bool, float, Dict[str, Any], Dict[str, Any]]:
     """
-    Process a single mask through both filters.
+    Process a single mask through all filters.
     
     Args:
         mask_path: Path to the mask image
         circularity_threshold: Minimum circularity score
         original_metadata: Optional DataFrame with original metadata to inherit from
         debug_mode: Enable debug mode for detailed error information
+        enable_edge_filter: Enable edge detection filter
+        edge_margin: Minimum distance from edge (pixels)
         
     Returns:
-        Tuple of (filtered_mask, passed_singularity, passed_circularity, circularity_score, metadata, contour_data)
+        Tuple of (filtered_mask, passed_singularity, passed_circularity, passed_edge, circularity_score, metadata, contour_data)
     """
     filename = Path(mask_path).name
     metadata = {
@@ -335,7 +361,7 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_me
                 'status': 'FAILED_LOAD',
                 'error': 'Could not load image'
             })
-        return None, False, False, 0.0, metadata, empty_contour_data
+        return None, False, False, False, 0.0, metadata, empty_contour_data
     
     # Apply singularity filter
     singular_mask = apply_singularity_filter(mask)
@@ -350,7 +376,7 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_me
                 'status': 'FAILED_SINGULARITY',
                 'error': 'No valid contours found'
             })
-        return None, False, False, 0.0, metadata, empty_contour_data
+        return None, False, False, False, 0.0, metadata, empty_contour_data
     
     passed_singularity = True
     
@@ -368,6 +394,14 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_me
     
     # Update bounding box coordinates based on the filtered mask
     bbox_x, bbox_y, bbox_w, bbox_h = get_bounding_box(singular_mask)
+    
+    # Apply edge filter
+    passed_edge = True
+    if enable_edge_filter:
+        image_shape = mask.shape  # Original mask shape (height, width)
+        bbox = (bbox_x, bbox_y, bbox_w, bbox_h)
+        if touches_edge(bbox, image_shape, edge_margin):
+            passed_edge = False
     
     # Calculate centroid from the filtered mask
     contours, _ = cv2.findContours(singular_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -397,7 +431,9 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_me
         'centroid_x': centroid_x,
         'centroid_y': centroid_y,
         'contour_count': contour_count,
-        'circularity': round(circularity_score, 4)
+        'circularity': round(circularity_score, 4),
+        'touches_edge': not passed_edge,
+        'edge_margin': edge_margin
     })
     
     # Create separate contour data for dedicated contours file
@@ -410,20 +446,34 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_me
     # Apply circular filter
     passed_circularity = is_circular(singular_mask, circularity_threshold)
     
-    if passed_circularity:
+    # Check if mask passes all filters
+    passed_all_filters = passed_circularity and passed_edge
+    
+    if passed_all_filters:
         if debug_mode:
             metadata.update({
                 'status': 'PASSED',
                 'error': 'none'
             })
-        return singular_mask, passed_singularity, passed_circularity, circularity_score, metadata, contour_data
+        return singular_mask, passed_singularity, passed_circularity, passed_edge, circularity_score, metadata, contour_data
     else:
         if debug_mode:
-            metadata.update({
-                'status': 'FAILED_CIRCULARITY',
-                'error': f'Circularity {circularity_score:.3f} below threshold {circularity_threshold}'
-            })
-        return None, passed_singularity, passed_circularity, circularity_score, metadata, contour_data
+            if not passed_circularity and not passed_edge:
+                metadata.update({
+                    'status': 'FAILED_CIRCULARITY_AND_EDGE',
+                    'error': f'Circularity {circularity_score:.3f} below threshold {circularity_threshold} and touches edge'
+                })
+            elif not passed_circularity:
+                metadata.update({
+                    'status': 'FAILED_CIRCULARITY',
+                    'error': f'Circularity {circularity_score:.3f} below threshold {circularity_threshold}'
+                })
+            else:  # not passed_edge
+                metadata.update({
+                    'status': 'FAILED_EDGE',
+                    'error': f'Bounding box touches image edge (margin: {edge_margin}px)'
+                })
+        return None, passed_singularity, passed_circularity, passed_edge, circularity_score, metadata, contour_data
 
 
 def write_contours_csv(contours_list: list, output_path: Path):
@@ -478,6 +528,9 @@ def write_metadata_csv(metadata_list: list, output_path: Path):
         'circularity',
         'circularity_score',
         'circularity_threshold',
+        'touches_edge',
+        'edge_margin',
+        'edge_filter_enabled',
         'overlap_threshold',
         'overlap_iou',
         'overlap_with'
@@ -512,13 +565,17 @@ def write_metadata_csv(metadata_list: list, output_path: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Filter masks using singularity, circular, and overlap filters. If metadata.csv exists in input directory, all original columns will be inherited in the output metadata.")
+    parser = argparse.ArgumentParser(description="Filter masks using singularity, circular, edge, and overlap filters. If metadata.csv exists in input directory, all original columns will be inherited in the output metadata.")
     parser.add_argument("input_dir", help="Directory containing input masks")
     parser.add_argument("-o", "--output_dir", help="Output directory for filtered masks (default: creates filter_TIMESTAMP folder inside input_dir)")
     parser.add_argument("-c", "--circularity_threshold", type=float, default=0.6, 
                        help="Minimum circularity score (0.0-1.0, default: 0.6)")
     parser.add_argument("--overlap_threshold", type=float, default=0.8,
                        help="IoU threshold for overlap filter (0.0-1.0, default: 0.8)")
+    parser.add_argument("--disable_edge_filter", action="store_true", default=False,
+                       help="Disable edge detection filter (allow masks touching image edges)")
+    parser.add_argument("--edge_margin", type=int, default=0,
+                       help="Minimum distance from image edge in pixels (default: 0)")
     parser.add_argument("-e", "--extensions", nargs="+", default=["png", "jpg", "jpeg", "bmp", "tiff"],
                        help="Image file extensions to process")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite input directory instead of creating new folder")
@@ -560,6 +617,9 @@ def main():
     print(f"Found {len(mask_files)} mask files")
     print(f"Circularity threshold: {args.circularity_threshold}")
     print(f"Overlap threshold: {args.overlap_threshold}")
+    print(f"Edge filter: {'disabled' if args.disable_edge_filter else 'enabled'}")
+    if not args.disable_edge_filter:
+        print(f"Edge margin: {args.edge_margin} pixels")
     
     # Load original metadata if available
     original_metadata = load_original_metadata(input_dir)
@@ -568,12 +628,13 @@ def main():
     else:
         print("No original metadata.csv found - creating new metadata from scratch")
     
-    # Process masks (singularity + circularity filters)
+    # Process masks (singularity + circularity + edge filters)
     stats = {
         'total': len(mask_files),
         'passed_singularity': 0,
         'passed_circularity': 0,
-        'passed_both': 0,
+        'passed_edge': 0,
+        'passed_all_initial': 0,
         'passed_overlap': 0,
         'failed_load': 0
     }
@@ -586,7 +647,14 @@ def main():
         if args.debug:
             print(f"Processing {i+1}/{len(mask_files)}: {Path(mask_path).name}", end=" ")
         
-        filtered_mask, passed_sing, passed_circ, circularity_score, metadata, contour_data = process_mask(mask_path, args.circularity_threshold, original_metadata, args.debug)
+        filtered_mask, passed_sing, passed_circ, passed_edge, circularity_score, metadata, contour_data = process_mask(
+            mask_path, 
+            args.circularity_threshold, 
+            original_metadata, 
+            args.debug,
+            not args.disable_edge_filter,
+            args.edge_margin
+        )
         
         # Always collect contour data
         all_contours_list.append(contour_data)
@@ -595,7 +663,8 @@ def main():
         metadata.update({
             'circularity_score': round(circularity_score, 4),
             'circularity_threshold': args.circularity_threshold,
-            'overlap_threshold': args.overlap_threshold
+            'overlap_threshold': args.overlap_threshold,
+            'edge_filter_enabled': not args.disable_edge_filter
         })
         
         # Always add to all_metadata_list for debug mode
@@ -613,9 +682,12 @@ def main():
         
         if passed_circ:
             stats['passed_circularity'] += 1
+            
+        if passed_edge:
+            stats['passed_edge'] += 1
         
-        if filtered_mask is not None and passed_circ:
-            stats['passed_both'] += 1
+        if filtered_mask is not None and passed_circ and passed_edge:
+            stats['passed_all_initial'] += 1
             
             # Store mask data for overlap filtering
             passed_mask_data_list.append({
@@ -628,8 +700,16 @@ def main():
                 print("- PASSED (before overlap filter)")
         else:
             if args.debug:
-                if passed_sing and not passed_circ:
-                    print("- FAILED (not circular enough)")
+                failed_reasons = []
+                if not passed_sing:
+                    failed_reasons.append("singularity")
+                if not passed_circ:
+                    failed_reasons.append("circularity")
+                if not passed_edge:
+                    failed_reasons.append("edge")
+                
+                if failed_reasons:
+                    print(f"- FAILED ({', '.join(failed_reasons)})")
                 else:
                     print("- FAILED")
     
@@ -657,7 +737,7 @@ def main():
             if filename in kept_filenames:
                 # This mask was kept after overlap filter - no changes needed
                 pass
-            elif metadata.get('status') == 'PASSED':
+            elif metadata.get('status') in ['PASSED']:
                 # This mask passed initial filters but was removed by overlap filter
                 metadata['status'] = 'FAILED_OVERLAP'
                 if filename in overlap_metadata_map:
@@ -701,9 +781,10 @@ def main():
     print(f"Failed to load/process: {stats['failed_load']}")
     print(f"Passed singularity filter: {stats['passed_singularity']}")
     print(f"Passed circularity filter: {stats['passed_circularity']}")
-    print(f"Passed both initial filters: {stats['passed_both']}")
+    print(f"Passed edge filter: {stats['passed_edge']}")
+    print(f"Passed all initial filters: {stats['passed_all_initial']}")
     print(f"Passed all filters (including overlap): {stats['passed_overlap']}")
-    print(f"Removed by overlap filter: {stats['passed_both'] - stats['passed_overlap']}")
+    print(f"Removed by overlap filter: {stats['passed_all_initial'] - stats['passed_overlap']}")
     print(f"Final success rate: {stats['passed_overlap']/stats['total']*100:.1f}%")
     
     if not args.dry_run:
