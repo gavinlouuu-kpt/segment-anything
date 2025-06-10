@@ -37,9 +37,9 @@ except ImportError as e:
 # Import processing functions
 try:
     from filter import (
-        process_mask, apply_overlap_filter, write_metadata_csv,
+        process_mask, apply_overlap_filter, write_metadata_csv, write_contours_csv,
         find_largest_contour, calculate_circularity, is_circular,
-        apply_singularity_filter
+        apply_singularity_filter, get_bounding_box
     )
     from categorise import categorize_bboxes
     from category_counting import analyze_category_containment
@@ -90,66 +90,148 @@ class IntegratedPipeline:
         print(f"Generated {len(masks)} masks in {elapsed:.2f} seconds")
         return masks
     
+    def _process_sam_mask(self, mask_dict: Dict[str, Any], mask_id: int, 
+                         circularity_threshold: float, debug: bool = False) -> Tuple[Optional[np.ndarray], Dict[str, Any], Dict[str, Any]]:
+        """
+        Process a single SAM mask using the modular filter functions.
+        
+        Args:
+            mask_dict: SAM mask dictionary
+            mask_id: ID to assign to this mask
+            circularity_threshold: Circularity threshold
+            debug: Debug mode flag
+            
+        Returns:
+            Tuple of (filtered_mask, metadata, contour_data)
+        """
+        # Convert SAM mask to binary mask
+        mask = mask_dict["segmentation"].astype(np.uint8) * 255
+        
+        # Apply singularity filter (keep largest component)
+        filtered_mask = apply_singularity_filter(mask)
+        
+        # Initialize metadata with SAM-specific fields
+        metadata = {
+            'id': mask_id,
+            'filename': f"{mask_id}.png",
+            'area': mask_dict.get('area', 0),
+            'bbox_x0': mask_dict.get('bbox', [0, 0, 0, 0])[0],
+            'bbox_y0': mask_dict.get('bbox', [0, 0, 0, 0])[1],
+            'bbox_w': mask_dict.get('bbox', [0, 0, 0, 0])[2],
+            'bbox_h': mask_dict.get('bbox', [0, 0, 0, 0])[3],
+            'point_input_x': mask_dict.get('point_coords', [[0, 0]])[0][0],
+            'point_input_y': mask_dict.get('point_coords', [[0, 0]])[0][1],
+            'predicted_iou': mask_dict.get('predicted_iou', 0),
+            'stability_score': mask_dict.get('stability_score', 0),
+            'crop_box_x0': mask_dict.get('crop_box', [0, 0, 0, 0])[0],
+            'crop_box_y0': mask_dict.get('crop_box', [0, 0, 0, 0])[1],
+            'crop_box_w': mask_dict.get('crop_box', [0, 0, 0, 0])[2],
+            'crop_box_h': mask_dict.get('crop_box', [0, 0, 0, 0])[3]
+        }
+        
+        if filtered_mask is None:
+            metadata.update({
+                'contour_count': 0,
+                'circularity': 0.0,
+                'status': 'FAILED' if debug else 'FAILED',
+            })
+            empty_contour_data = {
+                'id': mask_id,
+                'filename': f"{mask_id}.png",
+                'largest_contour_points': []
+            }
+            if debug:
+                metadata['error'] = 'No valid contours found after singularity filter'
+            return None, metadata, empty_contour_data
+        
+        # Apply circularity filter and calculate all geometric properties
+        is_circ = is_circular(filtered_mask, circularity_threshold)
+        
+        # Calculate detailed contour information
+        contours, _ = cv2.findContours(filtered_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        circularity_score = 0.0
+        contour_count = len(contours)
+        largest_contour_points = []
+        
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            circularity_score = calculate_circularity(largest_contour)
+            # Convert contour to list of [x, y] coordinates
+            largest_contour_points = largest_contour.reshape(-1, 2).tolist()
+        
+        # Update bounding box and area based on filtered mask (more accurate)
+        bbox_x, bbox_y, bbox_w, bbox_h = get_bounding_box(filtered_mask)
+        actual_area = cv2.countNonZero(filtered_mask)
+        
+        # Calculate centroid
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            M = cv2.moments(largest_contour)
+            if M["m00"] != 0:
+                centroid_x = M["m10"] / M["m00"]
+                centroid_y = M["m01"] / M["m00"]
+            else:
+                centroid_x = bbox_x + bbox_w / 2
+                centroid_y = bbox_y + bbox_h / 2
+        else:
+            centroid_x = bbox_x + bbox_w / 2
+            centroid_y = bbox_y + bbox_h / 2
+        
+        # Update metadata with corrected geometric properties
+        metadata.update({
+            'area': float(actual_area),
+            'bbox_x0': float(bbox_x),
+            'bbox_y0': float(bbox_y), 
+            'bbox_w': float(bbox_w),
+            'bbox_h': float(bbox_h),
+            'centroid_x': centroid_x,
+            'centroid_y': centroid_y,
+            'contour_count': contour_count,
+            'circularity': round(circularity_score, 4),
+            'status': 'PASSED' if is_circ else 'FAILED'
+        })
+        
+        # Create separate contour data
+        contour_data = {
+            'id': mask_id,
+            'filename': f"{mask_id}.png",
+            'largest_contour_points': largest_contour_points
+        }
+        
+        if debug and not is_circ:
+            metadata['error'] = f'Circularity {circularity_score:.3f} below threshold {circularity_threshold}'
+        
+        return filtered_mask if is_circ else None, metadata, contour_data
+
     def step2_filter_masks(self, masks: List[Dict[str, Any]], output_dir: str,
                           overlap_threshold: float = 0.8, 
                           circularity_threshold: float = 0.6,
                           debug: bool = False) -> Tuple[List[Dict[str, Any]], pd.DataFrame]:
-        """Step 2: Filter masks based on circularity and overlap."""
+        """Step 2: Filter masks based on circularity and overlap using modular filter functions."""
         print(f"\n=== Step 2: Filtering {len(masks)} masks ===")
         
         # Create output directory for filtered masks
         filtered_dir = os.path.join(output_dir, "filtered")
         os.makedirs(filtered_dir, exist_ok=True)
         
-        # Process each mask
+        # Process each mask using the modular filter functions
         mask_data_list = []
-        for i, mask_dict in enumerate(masks):
-            mask = mask_dict["segmentation"].astype(np.uint8) * 255
-            
-            # Apply singularity filter (keep largest component)
-            filtered_mask = apply_singularity_filter(mask)
-            
-            if filtered_mask is not None:
-                # Check circularity
-                is_circ = is_circular(filtered_mask, circularity_threshold)
-                
-                # Calculate circularity score
-                contours, _ = cv2.findContours(filtered_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                circularity_score = 0.0
-                if contours:
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    circularity_score = calculate_circularity(largest_contour)
-                
-                # Create metadata
-                metadata = {
-                    'id': i,
-                    'area': mask_dict.get('area', 0),
-                    'bbox_x0': mask_dict.get('bbox', [0, 0, 0, 0])[0],
-                    'bbox_y0': mask_dict.get('bbox', [0, 0, 0, 0])[1],
-                    'bbox_w': mask_dict.get('bbox', [0, 0, 0, 0])[2],
-                    'bbox_h': mask_dict.get('bbox', [0, 0, 0, 0])[3],
-                    'point_input_x': mask_dict.get('point_coords', [[0, 0]])[0][0],
-                    'point_input_y': mask_dict.get('point_coords', [[0, 0]])[0][1],
-                    'predicted_iou': mask_dict.get('predicted_iou', 0),
-                    'stability_score': mask_dict.get('stability_score', 0),
-                    'crop_box_x0': mask_dict.get('crop_box', [0, 0, 0, 0])[0],
-                    'crop_box_y0': mask_dict.get('crop_box', [0, 0, 0, 0])[1],
-                    'crop_box_w': mask_dict.get('crop_box', [0, 0, 0, 0])[2],
-                    'crop_box_h': mask_dict.get('crop_box', [0, 0, 0, 0])[3],
-                    'circularity': round(circularity_score, 4),
-                    'status': 'PASSED' if is_circ else 'FAILED',
-                    'filename': f"{i}.png"
-                }
-                
-                mask_data = {
-                    'mask': filtered_mask if is_circ else None,
-                    'metadata': metadata,
-                    'path': os.path.join(filtered_dir, f"{i}.png")
-                }
-                
-                mask_data_list.append(mask_data)
+        contour_data_list = []
         
-        # Apply overlap filter
+        for i, mask_dict in enumerate(masks):
+            filtered_mask, metadata, contour_data = self._process_sam_mask(mask_dict, i, circularity_threshold, debug)
+            
+            # Collect contour data
+            contour_data_list.append(contour_data)
+            
+            mask_data = {
+                'mask': filtered_mask,
+                'metadata': metadata,
+                'path': os.path.join(filtered_dir, f"{i}.png")
+            }
+            mask_data_list.append(mask_data)
+        
+        # Apply overlap filter using the modular function
         print(f"Applying overlap filter (threshold: {overlap_threshold})...")
         filtered_mask_data = apply_overlap_filter(mask_data_list, overlap_threshold)
         
@@ -168,12 +250,17 @@ class IntegratedPipeline:
         # Create metadata DataFrame
         metadata_df = pd.DataFrame(metadata_list)
         
-        # Save metadata CSV
+        # Save metadata CSV using the modular function
         metadata_csv_path = os.path.join(filtered_dir, "metadata.csv")
-        metadata_df.to_csv(metadata_csv_path, index=False)
+        write_metadata_csv(metadata_list, Path(metadata_csv_path))
+        
+        # Save contours CSV
+        contours_csv_path = os.path.join(filtered_dir, "contours.csv")
+        write_contours_csv(contour_data_list, Path(contours_csv_path))
         
         passed_count = len(metadata_df[metadata_df['status'] == 'PASSED'])
         print(f"Filtering complete: {saved_count} masks saved, {passed_count} passed all filters")
+        print(f"Contour data saved to: {contours_csv_path}")
         
         return filtered_mask_data, metadata_df
     
@@ -366,14 +453,22 @@ class IntegratedPipeline:
         
         for _, row in passed_masks.iterrows():
             x, y, w, h = row['bbox_x0'], row['bbox_y0'], row['bbox_w'], row['bbox_h']
+            mask_id = row['id']
+            
             if row['category'] == 0:
                 rect = patches.Rectangle((x, y), w, h, linewidth=2, edgecolor='red', 
                                        facecolor='none', linestyle='-', alpha=0.8)
                 parent_count += 1
+                # Add mask ID number for parent masks
+                ax2.text(x + 5, y + 15, str(mask_id), fontsize=8, fontweight='bold', 
+                        color='red', bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.8))
             else:
                 rect = patches.Rectangle((x, y), w, h, linewidth=1, edgecolor='blue', 
                                        facecolor='none', linestyle='--', alpha=0.6)
                 child_count += 1
+                # Add mask ID number for child masks
+                ax2.text(x + 5, y + 15, str(mask_id), fontsize=8, fontweight='bold', 
+                        color='blue', bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.8))
             ax2.add_patch(rect)
         
         ax2.set_title(f"Category Classification\nParents: {parent_count} | Children: {child_count}", 
@@ -402,6 +497,10 @@ class IntegratedPipeline:
                         ha='center', va='center', fontsize=10, fontweight='bold', 
                         color='white' if result.contained_count > 5 else 'black')
                 
+                # Add parent mask ID number
+                ax3.text(x + 5, y + 15, str(result.cat0_id), fontsize=8, fontweight='bold', 
+                        color='black', bbox=dict(boxstyle="round,pad=0.2", facecolor='yellow', alpha=0.9))
+                
                 # Draw contained children
                 for cat1_id in result.contained_cat1_ids:
                     if cat1_id in cat1_data:
@@ -410,6 +509,10 @@ class IntegratedPipeline:
                                                edgecolor='yellow', facecolor='none', 
                                                linestyle=':', alpha=0.8)
                         ax3.add_patch(rect)
+                        
+                        # Add child mask ID number
+                        ax3.text(x1 + 5, y1 + 15, str(cat1_id), fontsize=8, fontweight='bold', 
+                                color='black', bbox=dict(boxstyle="round,pad=0.2", facecolor='cyan', alpha=0.9))
         
         ax3.set_title("Containment Analysis\n(Numbers show contained count)", 
                      fontsize=12, fontweight='bold')
@@ -430,6 +533,9 @@ class IntegratedPipeline:
                 ax4.add_patch(rect)
                 ax4.text(x + w/2, y + h/2, 'BIG', ha='center', va='center', 
                         fontsize=8, fontweight='bold', color='black')
+                # Add mask ID number for oversized masks
+                ax4.text(x + 5, y + 15, str(result.cat0_id), fontsize=8, fontweight='bold', 
+                        color='black', bbox=dict(boxstyle="round,pad=0.2", facecolor='orange', alpha=0.9))
                 oversized_count += 1
                 
             elif result.is_undersized:
@@ -438,6 +544,9 @@ class IntegratedPipeline:
                 ax4.add_patch(rect)
                 ax4.text(x + w/2, y + h/2, 'SMALL', ha='center', va='center', 
                         fontsize=8, fontweight='bold', color='white')
+                # Add mask ID number for undersized masks
+                ax4.text(x + 5, y + 15, str(result.cat0_id), fontsize=8, fontweight='bold', 
+                        color='white', bbox=dict(boxstyle="round,pad=0.2", facecolor='purple', alpha=0.9))
                 undersized_count += 1
         
         ax4.set_title(f"Size Analysis\nOversized: {oversized_count} | Undersized: {undersized_count}", 

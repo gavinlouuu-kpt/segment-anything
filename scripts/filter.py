@@ -289,16 +289,18 @@ def get_mask_id_from_filename(filename: str) -> Optional[int]:
     return None
 
 
-def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_metadata: Optional[pd.DataFrame] = None, debug_mode: bool = False) -> Tuple[Optional[np.ndarray], bool, bool, float, Dict[str, Any]]:
+def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_metadata: Optional[pd.DataFrame] = None, debug_mode: bool = False) -> Tuple[Optional[np.ndarray], bool, bool, float, Dict[str, Any], Dict[str, Any]]:
     """
     Process a single mask through both filters.
     
     Args:
         mask_path: Path to the mask image
         circularity_threshold: Minimum circularity score
+        original_metadata: Optional DataFrame with original metadata to inherit from
+        debug_mode: Enable debug mode for detailed error information
         
     Returns:
-        Tuple of (filtered_mask, passed_singularity, passed_circularity, circularity_score, metadata)
+        Tuple of (filtered_mask, passed_singularity, passed_circularity, circularity_score, metadata, contour_data)
     """
     filename = Path(mask_path).name
     metadata = {
@@ -323,31 +325,46 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_me
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
         print(f"Warning: Could not load mask {mask_path}")
+        empty_contour_data = {
+            'id': metadata.get('id', get_mask_id_from_filename(filename)),
+            'filename': filename,
+            'largest_contour_points': []
+        }
         if debug_mode:
             metadata.update({
                 'status': 'FAILED_LOAD',
                 'error': 'Could not load image'
             })
-        return None, False, False, 0.0, metadata
+        return None, False, False, 0.0, metadata, empty_contour_data
     
     # Apply singularity filter
     singular_mask = apply_singularity_filter(mask)
     if singular_mask is None:
+        empty_contour_data = {
+            'id': metadata.get('id', get_mask_id_from_filename(filename)),
+            'filename': filename,
+            'largest_contour_points': []
+        }
         if debug_mode:
             metadata.update({
                 'status': 'FAILED_SINGULARITY',
                 'error': 'No valid contours found'
             })
-        return None, False, False, 0.0, metadata
+        return None, False, False, 0.0, metadata, empty_contour_data
     
     passed_singularity = True
     
-    # Calculate circularity score
+    # Calculate circularity score and extract contour points
     contours, _ = cv2.findContours(singular_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     circularity_score = 0.0
+    contour_count = len(contours)
+    largest_contour_points = []
+    
     if contours:
         largest_contour = max(contours, key=cv2.contourArea)
         circularity_score = calculate_circularity(largest_contour)
+        # Convert contour to list of [x, y] coordinates
+        largest_contour_points = largest_contour.reshape(-1, 2).tolist()
     
     # Update bounding box coordinates based on the filtered mask
     bbox_x, bbox_y, bbox_w, bbox_h = get_bounding_box(singular_mask)
@@ -378,8 +395,17 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_me
         'bbox_x0': float(bbox_x),
         'bbox_y0': float(bbox_y),
         'centroid_x': centroid_x,
-        'centroid_y': centroid_y
+        'centroid_y': centroid_y,
+        'contour_count': contour_count,
+        'circularity': round(circularity_score, 4)
     })
+    
+    # Create separate contour data for dedicated contours file
+    contour_data = {
+        'id': metadata.get('id', get_mask_id_from_filename(filename)),
+        'filename': filename,
+        'largest_contour_points': largest_contour_points
+    }
     
     # Apply circular filter
     passed_circularity = is_circular(singular_mask, circularity_threshold)
@@ -390,14 +416,35 @@ def process_mask(mask_path: str, circularity_threshold: float = 0.6, original_me
                 'status': 'PASSED',
                 'error': 'none'
             })
-        return singular_mask, passed_singularity, passed_circularity, circularity_score, metadata
+        return singular_mask, passed_singularity, passed_circularity, circularity_score, metadata, contour_data
     else:
         if debug_mode:
             metadata.update({
                 'status': 'FAILED_CIRCULARITY',
                 'error': f'Circularity {circularity_score:.3f} below threshold {circularity_threshold}'
             })
-        return None, passed_singularity, passed_circularity, circularity_score, metadata
+        return None, passed_singularity, passed_circularity, circularity_score, metadata, contour_data
+
+
+def write_contours_csv(contours_list: list, output_path: Path):
+    """
+    Write contour data to CSV file.
+    
+    Args:
+        contours_list: List of contour data dictionaries
+        output_path: Path where to save the CSV file
+    """
+    if not contours_list:
+        return
+    
+    fieldnames = ['id', 'filename', 'largest_contour_points']
+    
+    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for contour_data in contours_list:
+            writer.writerow(contour_data)
 
 
 def write_metadata_csv(metadata_list: list, output_path: Path):
@@ -419,6 +466,16 @@ def write_metadata_csv(metadata_list: list, output_path: Path):
     # Define preferred column order for common fields
     preferred_order = [
         'filename',
+        'id',
+        'area',
+        'bbox_x0',
+        'bbox_y0', 
+        'bbox_w',
+        'bbox_h',
+        'centroid_x',
+        'centroid_y',
+        'contour_count',
+        'circularity',
         'circularity_score',
         'circularity_threshold',
         'overlap_threshold',
@@ -522,13 +579,17 @@ def main():
     }
     
     all_metadata_list = []  # For debug mode - includes all masks
+    all_contours_list = []  # For contour data collection
     passed_mask_data_list = []  # For overlap filtering - only passed masks
     
     for i, mask_path in enumerate(mask_files):
         if args.debug:
             print(f"Processing {i+1}/{len(mask_files)}: {Path(mask_path).name}", end=" ")
         
-        filtered_mask, passed_sing, passed_circ, circularity_score, metadata = process_mask(mask_path, args.circularity_threshold, original_metadata, args.debug)
+        filtered_mask, passed_sing, passed_circ, circularity_score, metadata, contour_data = process_mask(mask_path, args.circularity_threshold, original_metadata, args.debug)
+        
+        # Always collect contour data
+        all_contours_list.append(contour_data)
         
         # Add additional metadata
         metadata.update({
@@ -626,6 +687,11 @@ def main():
         metadata_csv_path = output_dir / "metadata.csv"
         write_metadata_csv(final_metadata_list, metadata_csv_path)
         print(f"Metadata saved to: {metadata_csv_path}")
+        
+        # Write contours CSV
+        contours_csv_path = output_dir / "contours.csv"
+        write_contours_csv(all_contours_list, contours_csv_path)
+        print(f"Contour data saved to: {contours_csv_path}")
     
     # Print statistics
     print("\n" + "="*50)

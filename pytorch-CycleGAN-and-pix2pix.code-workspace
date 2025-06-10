@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../pytorch-CycleGAN-and-pix2pix"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {}
+}
