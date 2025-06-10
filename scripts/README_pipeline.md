@@ -76,11 +76,11 @@ python scripts/pipeline.py \
     --input input/image.jpg \
     --output results
 
-# Process with visualization and debug mode
+# With debug mode for detailed logging  
 python scripts/pipeline.py \
     --input input/image.jpg \
     --output results \
-    --visualize --debug
+    --debug
 
 # Process directory of images
 python scripts/pipeline.py \
@@ -142,12 +142,8 @@ base_output_directory/
 │   ├── ...
 │   └── metadata.csv           # Filtered metadata
     ├── metadata_categorized.csv    # Categorized metadata
-    ├── masks_overlay.png          # All masks overlaid on original image
-    ├── detailed_analysis.png      # Comprehensive 4-panel analysis
-    ├── visualizations/             # Additional debug visualizations (if --visualize)
-    │   ├── containment_count_*.png
-    │   ├── summary_visualization.png
-    │   └── ...
+    ├── masks_overlay.png          # All masks overlaid on original image (always generated)
+    ├── detailed_analysis.png      # Comprehensive 4-panel analysis (always generated)
     └── pipeline_summary.json      # Pipeline configuration and results
 ```
 
@@ -220,11 +216,19 @@ Number of crop layers for the Automatic Mask Generator:
 
 ## Visualization
 
-When using `--visualize`, the pipeline generates several types of visualizations:
+The pipeline **always generates** two high-quality visualizations:
 
-1. **Containment Count Visualizations**: Show masks grouped by how many objects they contain
-2. **Disproportionate Size Visualizations**: Highlight masks that are unusually large or small
-3. **Summary Visualization**: Overall distribution statistics
+1. **`masks_overlay.png`**: Clean side-by-side view showing:
+   - Original image
+   - All filtered masks overlaid with color-coded categories (red=parents, blue=children)
+
+2. **`detailed_analysis.png`**: Comprehensive 4-panel analysis showing:
+   - Original image
+   - Category classification view
+   - Containment analysis with numerical counts
+   - Size analysis highlighting oversized/undersized instances
+
+These visualizations use the actual input image and provide much more useful insights than the old visualization approach.
 
 ## Performance
 
@@ -267,11 +271,10 @@ Here's a complete example workflow:
 mkdir -p models
 wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth -P models/
 
-# 2. Run pipeline on example image
+# 2. Run pipeline on example image  
 python scripts/pipeline.py \
     --input input/your_image.jpg \
     --output results/your_image_analysis \
-    --visualize \
     --debug
 
 # 3. Check results
