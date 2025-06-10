@@ -42,10 +42,7 @@ try:
         apply_singularity_filter
     )
     from categorise import categorize_bboxes
-    from category_counting import (
-        analyze_category_containment,
-        create_debug_visualizations
-    )
+    from category_counting import analyze_category_containment
 except ImportError as e:
     print(f"Error importing processing functions: {e}")
     print("Please ensure all script modules are available")
@@ -227,20 +224,12 @@ class IntegratedPipeline:
         if undersized > 0:
             print(f"  {undersized} masks flagged as undersized")
         
-        # Generate visualizations if requested
+        # Skip the old broken visualizations - we have better overlay visualizations now
         if visualize and image_path and output_dir:
-            print("Generating visualizations...")
-            vis_dir = os.path.join(output_dir, "visualizations")
-            os.makedirs(vis_dir, exist_ok=True)
-            
-            try:
-                create_debug_visualizations(
-                    results_with_flags, cat1_data, 
-                    os.path.dirname(image_path), vis_dir, filter_count
-                )
-                print(f"Visualizations saved to: {vis_dir}")
-            except Exception as e:
-                print(f"Warning: Failed to create visualizations: {e}")
+            print("Note: Additional debug visualizations skipped (using improved overlay visualizations instead)")
+            # The create_debug_visualizations function from category_counting.py has issues
+            # because it tries to load individual mask files that don't exist in the expected location.
+            # Our new overlay visualizations (masks_overlay.png and detailed_analysis.png) are much better.
         
         return {
             'distribution': distribution,
@@ -599,11 +588,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage
+  # Basic usage (includes visualizations automatically)
   python scripts/pipeline.py --input image.jpg --output results
 
-  # With visualization and debug
-  python scripts/pipeline.py --input image.jpg --output results --visualize --debug
+  # With debug mode for detailed logging
+  python scripts/pipeline.py --input image.jpg --output results --debug
 
   # Custom checkpoint and thresholds
   python scripts/pipeline.py --input image.jpg --output results --checkpoint models/sam_vit_l_0b3195.pth --overlap-threshold 0.8 --circularity-threshold 0.7
@@ -641,11 +630,11 @@ Examples:
     parser.add_argument("--circularity-threshold", type=float, default=0.6,
                        help="Circularity threshold for filtering (default: 0.6)")
     
-    # Visualization arguments
+    # Visualization arguments (kept for compatibility, but visualizations are always generated now)
     parser.add_argument("--visualize", action="store_true",
-                       help="Generate debug visualizations")
+                       help="Legacy option (visualizations are now always generated)")
     parser.add_argument("--filter-count", type=int,
-                       help="Only visualize instances with this many contained objects")
+                       help="Legacy option (no longer used)")
     
     # Debug mode
     parser.add_argument("--debug", action="store_true",
