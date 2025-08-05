@@ -1,3 +1,4 @@
+onnx_models/
 .nfs*
 crop_boxes/
 input/
