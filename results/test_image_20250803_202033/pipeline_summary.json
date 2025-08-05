@@ -1,0 +1,31 @@
+{
+  "pipeline_config": {
+    "input": "test_image.png",
+    "output": "results",
+    "checkpoint": "models/mobile_sam.pt",
+    "model_type": "vit_t",
+    "device": "cpu",
+    "crop_n_layers": 3,
+    "points_per_side": null,
+    "pred_iou_thresh": null,
+    "stability_score_thresh": null,
+    "overlap_threshold": 0.7,
+    "circularity_threshold": 0.6,
+    "visualize": false,
+    "filter_count": null,
+    "debug": false
+  },
+  "input_path": "test_image.png",
+  "output_path": "results/test_image_20250803_202033",
+  "base_output_path": "results",
+  "processing_time_seconds": 8984.73,
+  "results": {
+    "total_masks_generated": 5,
+    "masks_after_filtering": 4,
+    "parent_masks": 1,
+    "child_masks": 3,
+    "distribution": {
+      "3": 1
+    }
+  }
+}

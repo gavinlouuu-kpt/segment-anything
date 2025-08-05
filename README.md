@@ -44,6 +44,27 @@ git clone git@github.com:facebookresearch/segment-anything.git
 cd segment-anything; pip install -e .
 ```
 
+### Mobile SAM Support
+
+This project also supports [Mobile SAM](https://github.com/ChaoningZhang/MobileSAM), a lightweight version of SAM optimized for mobile devices. To use Mobile SAM:
+
+1. Install Mobile SAM:
+   ```
+   pip install git+https://github.com/ChaoningZhang/MobileSAM.git
+   ```
+
+2. Download the Mobile SAM checkpoint:
+   ```
+   wget -O models/mobile_sam.pt https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt
+   ```
+
+3. Use the `vit_t` model type in the pipeline:
+   ```
+   python scripts/pipeline.py --input image.jpg --output results --model-type vit_t --checkpoint models/mobile_sam.pt
+   ```
+
+Mobile SAM provides a 60x smaller model size and 5x faster inference while maintaining high segmentation quality, making it ideal for resource-constrained environments.
+
 The following optional dependencies are necessary for mask post-processing, saving masks in COCO format, the example notebooks, and exporting the model in ONNX format. `jupyter` is also required to run the example notebooks.
 
 ```

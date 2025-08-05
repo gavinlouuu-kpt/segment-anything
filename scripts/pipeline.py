@@ -26,9 +26,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 # Import functions from individual scripts
 try:
-    from amg import sam_model_registry, SamAutomaticMaskGenerator
+    from amg import sam_model_registry as original_sam_model_registry, SamAutomaticMaskGenerator
     import cv2
     import torch
+    
+    # Try to import Mobile SAM
+    try:
+        from mobile_sam import sam_model_registry as mobile_sam_model_registry
+        MOBILE_SAM_AVAILABLE = True
+    except ImportError:
+        MOBILE_SAM_AVAILABLE = False
+        mobile_sam_model_registry = None
+        
 except ImportError as e:
     print(f"Error importing SAM dependencies: {e}")
     print("Please ensure segment-anything and dependencies are installed")
@@ -50,7 +59,10 @@ except ImportError as e:
 
 
 class IntegratedPipeline:
-    """Integrated pipeline for SAM mask processing."""
+    """Integrated pipeline for SAM mask processing.
+    
+    Supports both original SAM models (vit_h, vit_l, vit_b) and Mobile SAM (vit_t).
+    """
     
     def __init__(self, checkpoint: str, model_type: str = "vit_h", device: str = "cuda"):
         """Initialize the pipeline with SAM model."""
@@ -59,17 +71,27 @@ class IntegratedPipeline:
         self.checkpoint = checkpoint
         self.sam = None
         self.mask_generator = None
+        # Determine if we're using Mobile SAM
+        self.is_mobile_sam = model_type == "vit_t" and MOBILE_SAM_AVAILABLE
         
     def load_model(self, **amg_kwargs):
         """Load the SAM model and create mask generator."""
-        print(f"Loading SAM model ({self.model_type}) from {self.checkpoint}...")
+        model_source = "Mobile SAM" if self.is_mobile_sam else "SAM"
+        print(f"Loading {model_source} model ({self.model_type}) from {self.checkpoint}...")
+        
         try:
-            self.sam = sam_model_registry[self.model_type](checkpoint=self.checkpoint)
+            if self.is_mobile_sam:
+                if not MOBILE_SAM_AVAILABLE:
+                    raise RuntimeError("Mobile SAM is not available. Please install it with: pip install git+https://github.com/ChaoningZhang/MobileSAM.git")
+                self.sam = mobile_sam_model_registry[self.model_type](checkpoint=self.checkpoint)
+            else:
+                self.sam = original_sam_model_registry[self.model_type](checkpoint=self.checkpoint)
+                
             self.sam.to(device=self.device)
             self.mask_generator = SamAutomaticMaskGenerator(self.sam, **amg_kwargs)
-            print("Model loaded successfully!")
+            print(f"{model_source} model loaded successfully!")
         except Exception as e:
-            raise RuntimeError(f"Failed to load SAM model: {e}")
+            raise RuntimeError(f"Failed to load {model_source} model: {e}")
     
     def step1_generate_masks(self, image_path: str) -> List[Dict[str, Any]]:
         """Step 1: Generate masks using SAM."""
@@ -586,7 +608,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Segment Anything Mask Processing Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Examples:
   # Basic usage (includes visualizations automatically)
   python scripts/pipeline.py --input image.jpg --output results
@@ -596,8 +618,17 @@ Examples:
 
   # Custom checkpoint and thresholds
   python scripts/pipeline.py --input image.jpg --output results --checkpoint models/sam_vit_l_0b3195.pth --overlap-threshold 0.8 --circularity-threshold 0.7
+  
+  # Using Mobile SAM (if available)
+  python scripts/pipeline.py --input image.jpg --output results --model-type vit_t --checkpoint models/mobile_sam.pt
         """
     )
+    
+    # Show Mobile SAM availability
+    if MOBILE_SAM_AVAILABLE:
+        parser.description += " Mobile SAM (vit_t) is available."
+    else:
+        parser.description += " Mobile SAM is not installed (pip install git+https://github.com/ChaoningZhang/MobileSAM.git)"
     
     # Required arguments
     parser.add_argument("--input", type=str, required=True,
@@ -608,9 +639,15 @@ Examples:
                        help="Path to SAM checkpoint file (default: models/sam_vit_h_4b8939.pth)")
     
     # Model arguments
+    # Add vit_t option if Mobile SAM is available
+    model_choices = ["default", "vit_h", "vit_l", "vit_b"]
+    if MOBILE_SAM_AVAILABLE:
+        model_choices.append("vit_t")
+        
     parser.add_argument("--model-type", type=str, default="vit_h",
-                       choices=["default", "vit_h", "vit_l", "vit_b"],
-                       help="SAM model type (default: vit_h)")
+                       choices=model_choices,
+                       help="SAM model type (default: vit_h)" + 
+                            (" | vit_t for Mobile SAM" if MOBILE_SAM_AVAILABLE else ""))
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device to run on (default: cuda)")
     

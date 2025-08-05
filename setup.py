@@ -13,6 +13,7 @@ setup(
     packages=find_packages(exclude="notebooks"),
     extras_require={
         "all": ["matplotlib", "pycocotools", "opencv-python", "onnx", "onnxruntime"],
+        "mobile": ["git+https://github.com/ChaoningZhang/MobileSAM.git"],
         "dev": ["flake8", "isort", "black", "mypy"],
     },
 )
